@@ -1,6 +1,6 @@
 import {
   importDataKey, seal, unseal, randomId, b64, unb64, utf8, fromUtf8, normName, makeUserEntry, openUserEntry,
-} from './crypto.js?v=5';
+} from './crypto.js?v=6';
 
 const REPO = 'umi-card/seiken-members';
 const BRANCH = 'main';
@@ -654,6 +654,14 @@ document.addEventListener('click', async (ev) => {
   const el = ev.target.closest('[data-act]');
   if (!el || el.tagName === 'INPUT') return;
   const { act, id } = el.dataset;
+  // deletes need a second tap instead of confirm(), which some in-app browsers suppress
+  if (['del', 'todoDel', 'delUser'].includes(act) && el.dataset.armed !== '1') {
+    const label = el.textContent;
+    el.dataset.armed = '1';
+    el.textContent = 'もう一度押すと削除';
+    setTimeout(() => { if (el.isConnected) { el.dataset.armed = ''; el.textContent = label; } }, 3000);
+    return;
+  }
   if (act === 'rename') renderDisplayName(false);
   else if (act === 'logout') { clearSession(); location.hash = ''; renderLogin(); }
   else if (act === 'refresh') refresh(false);
@@ -665,19 +673,16 @@ document.addEventListener('click', async (ev) => {
       st.todo[id] = { s: ST_NEXT[st.todo[id]?.s || ''] ?? next, uid: S.session.uid, ts: Date.now() };
     }, `todo: ${id} → ${next || 'todo'}`);
   } else if (act === 'del') {
-    if (!confirm('この投稿を削除しますか？')) return;
     await mutate((st) => { st.posts = st.posts.filter((p) => p.id !== id && p.ref !== id); }, 'delete post');
   } else if (act === 'pin') {
     await mutate((st) => { const p = st.posts.find((x) => x.id === id); if (p) p.pinned = !p.pinned; }, 'pin post');
   } else if (act === 'todoDel') {
-    if (!confirm(`「${todoById(id)?.text ?? ''}」を削除しますか？`)) return;
     await mutate((st) => {
       st.todos = st.todos.filter((x) => x.id !== id);
       st.posts = st.posts.filter((p) => p.ref !== id);
       delete st.todo[id];
     }, 'delete todo');
   } else if (act === 'delUser') {
-    if (!confirm(`${dn(id)}（${S.dir[id]}）を削除しますか？`)) return;
     try {
       await writeKeys(async (keys) => {
         const e = entryByUid(keys, id);
