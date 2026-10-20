@@ -1,7 +1,7 @@
 import {
   importDataKey, seal, unseal, sealBytes, unsealBytes, randomId, b64, unb64, utf8, fromUtf8, normName,
   makeUserEntry, openUserEntry, resealUserEntry, newDmKeyPair, dmKey,
-} from './crypto.js?v=7';
+} from './crypto.js?v=8';
 
 const REPO = 'umi-card/seiken-members';
 const BRANCH = 'main';
@@ -109,6 +109,15 @@ async function readBinary(path) {
 }
 
 async function fetchKeys() {
+  if (!S.token && !LOCAL) {
+    // Pages can lag a minute or more behind the repo; ask GitHub directly first (60/hour without a key)
+    try {
+      const r = await fetch(`https://api.github.com/repos/${REPO}/contents/${KEYS_PATH}?ref=${BRANCH}`, {
+        cache: 'no-store', headers: { Accept: 'application/vnd.github.raw' },
+      });
+      if (r.ok) return await r.json();
+    } catch {}
+  }
   const { text } = await readFile(KEYS_PATH);
   return JSON.parse(text);
 }
@@ -189,7 +198,7 @@ async function openSession(sess) {
   setupDm();
 }
 
-const sessionValid = (keys, sess) => !!sess?.ek && keys.users?.[sess.id]?.kid === sess.kid;
+const sessionValid = (keys, sess) => !!sess?.id && keys.users?.[sess.id]?.kid === sess.kid;
 const entryByUid = (keys, uid) => Object.entries(keys.users).find(([, e]) => e.uid === uid);
 
 async function boot() {
@@ -201,17 +210,22 @@ async function boot() {
     $app.innerHTML = '<p class="boot">読み込みに失敗しました</p>';
     return;
   }
-  if (saved && !saved.ek) { clearSession(); return renderLogin(); } // session from before DMs existed
-  if (sessionValid(S.keys, saved)) {
+  if (saved?.id && saved.k) {
     try {
-      // the role may have been changed by the admin since the last visit
-      saved.role = S.keys.users[saved.id].role;
       await openSession(saved);
+      // the copy fetched before login may be out of date; check again with the GitHub key
+      if (S.token && !LOCAL) S.keys = await fetchKeys();
+      if (!sessionValid(S.keys, saved)) {
+        clearSession();
+        return renderLogin('パスワードが変更されました');
+      }
+      S.session.role = S.keys.users[saved.id].role; // the admin may have changed it
       return render();
-    } catch { clearSession(); }
-  } else if (saved) {
-    clearSession();
-    return renderLogin('パスワードが変更されました');
+    } catch {
+      // network trouble: keep the session and let the user retry
+      $app.innerHTML = '<p class="boot">読み込みに失敗しました</p>';
+      return;
+    }
   }
   renderLogin();
 }
@@ -278,11 +292,19 @@ const pubOf = (j) => ({ kty: j.kty, crv: j.crv, x: j.x, y: j.y });
 // Make sure I have a DM key pair (kept inside my encrypted user entry) and that my public key is published
 let dmSetupRunning = false;
 async function setupDm() {
-  if (dmSetupRunning || !S.session || (!S.token && !LOCAL)) return;
-  const uid = S.session.uid;
-  if (S.session.priv && S.data.pub[uid]?.x === S.session.priv.x) return;
+  if (dmSetupRunning || !S.session) return;
   dmSetupRunning = true;
   try {
+    const uid = S.session.uid;
+    // a key may already be waiting in my entry (made in advance, or on another device)
+    if (!S.session.priv && S.session.ek) {
+      try {
+        S.session.priv = (await unseal(await importDataKey(S.session.ek), S.keys.users[S.session.id])).priv || null;
+      } catch {}
+      if (S.session.priv) { saveSession(); await prepDms(); render(); }
+    }
+    if (S.session.priv && S.data.pub[uid]?.x === S.session.priv.x) return;
+    if ((!S.token && !LOCAL) || !S.session.ek) return;
     if (!S.session.priv) {
       const { priv } = await newDmKeyPair();
       await writeKeys(async (keys) => {
@@ -491,7 +513,7 @@ function render() {
 
   // keep half-typed text and focus across re-renders
   const kept = {};
-  document.querySelectorAll('[data-k]').forEach((el) => { kept[el.dataset.k] = el.value; });
+  document.querySelectorAll('[data-k]').forEach((el) => { kept[el.dataset.k] = el.type === 'checkbox' ? el.checked : el.value; });
   const focusK = document.activeElement?.dataset?.k;
 
   document.title = S.content.title;
@@ -510,7 +532,11 @@ function render() {
   </header>
   <main>${!S.token && !LOCAL && isAdmin() ? '<div class="banner">GitHubキー未設定</div>' : ''}${body}</main>`;
 
-  document.querySelectorAll('[data-k]').forEach((el) => { if (kept[el.dataset.k] != null) el.value = kept[el.dataset.k]; });
+  document.querySelectorAll('[data-k]').forEach((el) => {
+    const v = kept[el.dataset.k];
+    if (v == null) return;
+    if (el.type === 'checkbox') el.checked = v; else el.value = v;
+  });
   if (focusK) document.querySelector(`[data-k="${focusK}"]`)?.focus();
   hydrateImages();
 }
@@ -541,6 +567,10 @@ function vHome() {
   return `
   ${hero}
   ${vShiftNowCard()}
+  <div class="card">
+    <div class="row"><h3 class="grow">掲示板</h3><a class="small" href="#board">一覧</a></div>
+    ${board.length ? board.map((p) => postHtml(p)).join('') : '<p class="empty">投稿なし</p>'}
+  </div>
   <div class="grid2">
     <div class="card">
       <div class="row"><h3 class="grow">準備ToDo</h3><a class="small" href="#todo">一覧</a></div>
@@ -559,12 +589,8 @@ function vHome() {
     </div>` : ''}
   </div>
   <div class="card">
-    <div class="row"><h3 class="grow">掲示板</h3><a class="small" href="#board">一覧</a></div>
-    ${board.length ? board.map((p) => postHtml(p, { comments: false })).join('') : '<p class="empty">投稿なし</p>'}
-  </div>
-  <div class="card">
     <div class="row"><h3 class="grow">進捗報告</h3><a class="small" href="#progress">一覧</a></div>
-    ${prog.length ? prog.map((p) => postHtml(p, { comments: false })).join('') : '<p class="empty">報告なし</p>'}
+    ${prog.length ? prog.map((p) => postHtml(p)).join('') : '<p class="empty">報告なし</p>'}
   </div>`;
 }
 
@@ -697,24 +723,40 @@ function reactHtml(p) {
   return `${REACTIONS.filter((e) => re[e]?.length || open).map(btn).join('')}<button class="link" data-act="toggle" data-id="rx-${p.id}">${open ? '閉じる' : 'リアクション'}</button>`;
 }
 
+const canEdit = (p) => p.uid === S.session.uid;
+const impMark = (p) => (p.imp ? '<span class="imp">重要</span>' : '');
+
 function postHtml(p, { comments = true, compact = false } = {}) {
   const cmts = comments ? postsOf('comment', p.id).sort((a, b) => a.ts - b.ts) : [];
   const open = S.ui.open.has(p.id);
+  const editing = S.ui.editing === p.id;
   const ref = p.kind === 'progress' && p.ref && !compact ? todoById(p.ref) : null;
   return `
   <div class="${compact ? 'cmt' : 'post'}">
     <div class="post-h">
+      ${impMark(p)}
       ${p.pinned ? '<span class="badge">固定</span>' : ''}
       ${p.kind === 'board' ? `<span class="badge">${esc(p.cat)}</span>` : ''}
       ${ref ? `<span class="badge">${esc(ref.text.length > 24 ? ref.text.slice(0, 24) + '…' : ref.text)}</span>` : ''}
-      <span class="a">${esc(whoOf(p))}</span>${adminMark(p.role)}<span class="ts">${fmtTs(p.ts)}</span>
+      <span class="a">${esc(whoOf(p))}</span>${adminMark(p.role)}<span class="ts">${fmtTs(p.ts)}${p.edited ? '（編集済み）' : ''}</span>
     </div>
-    ${p.body ? `<div class="post-b">${linkify(p.body)}</div>` : ''}
-    ${imgsHtml(p.imgs)}
+    ${editing ? `
+    <form class="compose" data-form="edit" data-id="${p.id}">
+      <textarea data-k="edit-${p.id}" maxlength="4000" rows="3">${esc(p.body)}</textarea>
+      <div class="row">
+        ${p.kind === 'board' ? `<label class="small row" style="gap:4px"><input type="checkbox" data-k="edit-imp-${p.id}" ${p.imp ? 'checked' : ''}>重要</label>` : ''}
+        <span class="grow"></span>
+        <button class="btn small ghost" type="button" data-act="cancelEdit">取消</button>
+        <button class="btn small" type="submit">保存</button>
+      </div>
+    </form>` : `
+    ${p.body ? `<div class="post-b ${comments ? 'tap' : ''}" ${comments ? `data-act="openThread" data-id="${p.id}"` : ''}>${linkify(p.body)}</div>` : ''}
+    ${imgsHtml(p.imgs)}`}
     <div class="post-f small">
       ${reactHtml(p)}
       ${comments ? `<button class="link" data-act="toggle" data-id="${p.id}">コメント${cmts.length ? `(${cmts.length})` : ''}</button>` : ''}
       ${isAdmin() && p.kind === 'board' ? `<button class="link" data-act="pin" data-id="${p.id}">${p.pinned ? '固定解除' : '固定'}</button>` : ''}
+      ${canEdit(p) && !editing ? `<button class="link" data-act="edit" data-id="${p.id}">編集</button>` : ''}
       ${canDelete(p) ? `<button class="link danger" data-act="del" data-id="${p.id}">削除</button>` : ''}
     </div>
     ${comments && open ? `<div class="thread">
@@ -734,7 +776,7 @@ function vBoard() {
     <form class="compose" data-form="board" style="margin-top:0">
       <select data-k="board-cat" style="width:auto">${CATS.map((c) => `<option>${c}</option>`).join('')}</select>
       <textarea data-k="board-body" maxlength="4000" rows="3"></textarea>
-      <div class="row">${photoPicker('board-body')}<button class="btn" type="submit">投稿</button></div>
+      <div class="row">${photoPicker('board-body')}<label class="small row" style="gap:4px"><input type="checkbox" data-k="board-imp">重要</label><button class="btn" type="submit">投稿</button></div>
     </form>
   </div>
   <div class="card">${posts.length ? posts.map((p) => postHtml(p)).join('') : '<p class="empty">投稿なし</p>'}</div>`;
@@ -817,7 +859,7 @@ function vDmThread(peer) {
       <textarea data-k="dm-${peer}" maxlength="4000" rows="2"></textarea>
       <div class="row">${photoPicker(`dm-${peer}`)}<button class="btn" type="submit">送信</button></div>
     </form>
-  </div>` : `<p class="empty">${S.session.priv ? '相手が未ログインのため送信できません' : '送信できません'}</p>`}`;
+  </div>` : `<p class="empty">${!S.session.ek ? 'DMを使うには一度ログインし直してください' : S.session.priv ? '相手が一度ログインすると送信できます' : '送信できません'}</p>`}`;
 }
 
 /* admin */
@@ -882,6 +924,14 @@ document.addEventListener('click', async (ev) => {
     return;
   }
   if (act === 'rename') renderDisplayName(false);
+  else if (act === 'edit') { S.ui.editing = id; render(); document.querySelector(`[data-k="edit-${id}"]`)?.focus(); }
+  else if (act === 'cancelEdit') { S.ui.editing = null; render(); }
+  else if (act === 'openThread') {
+    if (ev.target.closest('a')) return; // a link in the post was tapped
+    S.ui.open.add(id);
+    render();
+    document.querySelector(`[data-k="cmt-${id}"]`)?.focus();
+  }
   else if (act === 'react') {
     const e = el.dataset.e;
     const uid = S.session.uid;
@@ -959,7 +1009,7 @@ document.addEventListener('submit', async (ev) => {
   const kind = form.dataset.form;
   const val = (k) => form.querySelector(`[data-k="${k}"]`)?.value.trim() ?? '';
   // the form may have been re-rendered by mutate(), so clear the live fields
-  const clear = (...ks) => ks.forEach((k) => { const el = document.querySelector(`[data-k="${k}"]`); if (el) el.value = ''; });
+  const clear = (...ks) => ks.forEach((k) => { const el = document.querySelector(`[data-k="${k}"]`); if (el) { el.value = ''; el.checked = false; } });
   const btn = form.querySelector('button[type=submit]');
   btn.disabled = true;
   try {
@@ -967,8 +1017,9 @@ document.addEventListener('submit', async (ev) => {
       const body = val('board-body');
       if (!body && !hasPhotos('board-body')) return;
       const imgs = await uploadPhotos('board-body', S.K);
-      if (await mutate((st) => st.posts.push(newPost('board', '', body, val('board-cat') || '連絡', imgs)), 'board post')) {
-        delete S.ui.files['board-body']; clear('board-body'); render(); toast('投稿しました');
+      const imp = !!document.querySelector('[data-k="board-imp"]')?.checked;
+      if (await mutate((st) => st.posts.push({ ...newPost('board', '', body, val('board-cat') || '連絡', imgs), imp }), 'board post')) {
+        delete S.ui.files['board-body']; clear('board-body', 'board-imp'); render(); toast('投稿しました');
       }
     } else if (kind === 'comment') {
       const ref = form.dataset.ref;
@@ -997,6 +1048,18 @@ document.addEventListener('submit', async (ev) => {
       const msg = { id: randomId(), from: S.session.uid, to: peer, ts: Date.now(), ...(await seal(key, { t: text, imgs })) };
       S.dmPlain[msg.id] = { t: text, imgs };
       if (await mutate((st) => st.dms.push(msg), 'dm')) { delete S.ui.files[k]; clear(k); render(); }
+    } else if (kind === 'edit') {
+      const id = form.dataset.id;
+      const body = val(`edit-${id}`);
+      const impEl = form.querySelector(`[data-k="edit-imp-${id}"]`);
+      if (await mutate((st) => {
+        const p = st.posts.find((x) => x.id === id);
+        if (!p || p.uid !== S.session.uid) return;
+        if (!body && !p.imgs?.length) return;
+        p.body = body;
+        if (impEl) p.imp = impEl.checked;
+        p.edited = Date.now();
+      }, 'edit post')) { S.ui.editing = null; clear(`edit-${id}`); render(); }
     } else if (kind === 'todoAdd') {
       const date = form.dataset.date;
       const text = val(`todo-${date}`);
@@ -1012,11 +1075,12 @@ document.addEventListener('submit', async (ev) => {
       const role = self ? S.session.role : val(`urole-${uid}`) || 'member';
       btn.textContent = '変更中…';
       let newId, newEk;
+      const newKp = self ? null : await newDmKeyPair();
       await writeKeys(async (keys) => {
         const old = entryByUid(keys, uid);
         if (!old) throw new Error('この部員は削除されています');
-        // keep my own DM key; anyone else gets a new one on their next login
-        const priv = self ? S.session.priv : null;
+        // keep my own DM key; someone else gets a fresh one (their earlier DMs can no longer be opened)
+        const priv = self ? S.session.priv : newKp.priv;
         const { id, ek, entry } = await makeUserEntry(pw, S.session.k, { uid, name: S.dir[uid], role, priv }, keys);
         newEk = ek;
         if (keys.users[id] && keys.users[id].uid !== uid) throw new Error('他の人と同じパスワードは使えません');
@@ -1025,6 +1089,7 @@ document.addEventListener('submit', async (ev) => {
         newId = id;
       }, 'change user password');
       if (self) { S.session.id = newId; S.session.ek = newEk; S.session.kid = S.keys.users[newId].kid; saveSession(); }
+      else await mutate((st) => { st.pub[uid] = pubOf(newKp.pub); }, 'dm public key');
       S.ui.open.delete(`pw-${uid}`);
       toast('変更しました');
       render();
@@ -1036,12 +1101,14 @@ document.addEventListener('submit', async (ev) => {
       if (Object.values(S.dir).includes(name)) return toast('登録済みの名前です');
       btn.textContent = '追加中…';
       const uid = randomId(8);
+      const kp = await newDmKeyPair();
       await writeKeys(async (keys) => {
-        const { id, entry } = await makeUserEntry(pw, S.session.k, { uid, name, role: val('nu-role') || 'member' }, keys);
+        const { id, entry } = await makeUserEntry(pw, S.session.k, { uid, name, role: val('nu-role') || 'member', priv: kp.priv }, keys);
         if (keys.users[id]) throw new Error('他の人と同じパスワードは使えません');
         keys.users[id] = entry;
         keys.dir = await seal(S.K, { ...(keys.dir ? await unseal(S.K, keys.dir) : {}), [uid]: name });
       }, 'add user');
+      await mutate((st) => { st.pub[uid] = pubOf(kp.pub); }, 'dm public key');
       clear('nu-name', 'nu-pw');
       toast('追加しました');
       render();
