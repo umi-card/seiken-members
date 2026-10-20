@@ -1,7 +1,7 @@
 import {
   importDataKey, seal, unseal, sealBytes, unsealBytes, randomId, b64, unb64, utf8, fromUtf8, normName,
   makeUserEntry, openUserEntry, resealUserEntry, newDmKeyPair, dmKey,
-} from './crypto.js?v=8';
+} from './crypto.js?v=9';
 
 const REPO = 'umi-card/seiken-members';
 const BRANCH = 'main';
@@ -125,7 +125,7 @@ async function fetchKeys() {
 async function loadState() {
   const { text, sha } = await readFile(STATE_PATH);
   const state = await unseal(S.K, JSON.parse(text));
-  state.posts ||= []; state.todo ||= {}; state.todos ||= []; state.dms ||= []; state.pub ||= {}; state.names ||= {};
+  state.posts ||= []; state.todo ||= {}; state.todos ||= []; state.dms ||= []; state.pub ||= {}; state.names ||= {}; state.aliases ||= {};
   return { state, sha };
 }
 
@@ -173,6 +173,7 @@ async function writeKeys(fn, message) {
       await writeFile(KEYS_PATH, JSON.stringify(keys, null, 1), sha, message);
       S.keys = keys;
       S.dir = keys.dir ? await unseal(S.K, keys.dir) : {};
+      if (S.session && S.dir[S.session.uid]) S.session.name = S.dir[S.session.uid];
       return;
     } catch (e) {
       if (!e.conflict) throw e;
@@ -190,6 +191,7 @@ async function openSession(sess) {
   S.K = await importDataKey(sess.k);
   S.token = S.keys.tok ? (await unseal(S.K, S.keys.tok)).t : null;
   S.dir = S.keys.dir ? await unseal(S.K, S.keys.dir) : {};
+  if (S.session && S.dir[S.session.uid]) S.session.name = S.dir[S.session.uid];
   const r = await fetch(`data/content.enc.json?t=${Date.now()}`, { cache: 'no-store' });
   S.content = await unseal(S.K, await r.json());
   const { state, sha } = await loadState();
@@ -242,6 +244,7 @@ async function refresh(quiet = true) {
     S.session.role = keys.users[S.session.id].role;
     S.token = keys.tok ? (await unseal(S.K, keys.tok)).t : null;
     S.dir = keys.dir ? await unseal(S.K, keys.dir) : {};
+    if (S.session && S.dir[S.session.uid]) S.session.name = S.dir[S.session.uid];
     const { state, sha } = await loadState();
     const changed = JSON.stringify(state) !== JSON.stringify(S.data);
     S.data = state; S.sha = sha;
@@ -407,7 +410,7 @@ async function hydrateImages() {
 function renderDisplayName(first) {
   const uid = S.session.uid;
   const cur = S.data.names?.[uid]?.n || '';
-  const initial = initialOf(S.session.name);
+  const initial = initialOf(shiftNameOf(uid));
   $app.innerHTML = `
   <div class="login"><form id="dnForm">
     <h1>表示名</h1>
@@ -435,8 +438,10 @@ const canDelete = (p) => isAdmin() || p.uid === S.session.uid;
 
 // Display names: each member picks one on first login; until then their initial is shown
 const initialOf = (real) => S.content.initials?.[real] || String(real || '?').slice(0, 1);
-const uidOfMember = (real) => Object.keys(S.dir).find((k) => S.dir[k] === real);
-const dn = (uid) => S.data.names?.[uid]?.n || initialOf(S.dir[uid]);
+// The shift table uses the original registered names; `aliases` keeps that link after the admin renames someone
+const shiftNameOf = (uid) => S.data.aliases?.[uid] || S.dir[uid];
+const uidOfMember = (real) => Object.keys(S.dir).find((k) => shiftNameOf(k) === real);
+const dn = (uid) => S.data.names?.[uid]?.n || initialOf(shiftNameOf(uid));
 const dnMember = (real) => { const u = uidOfMember(real); return u ? dn(u) : initialOf(real); };
 const whoOf = (p) => (p.uid ? dn(p.uid) : p.author || '');
 const adminMark = (role) => (role === 'admin' ? '<span class="role">管理者</span>' : '');
@@ -560,7 +565,7 @@ function vHome() {
   const focusDay = todos.find((t) => t.date === ymd(d)) || todos.find((t) => t.date > ymd(d));
   const pending = focusDay ? focusDay.items.filter((i) => S.data.todo[i.id]?.s !== 'done') : [];
 
-  const me = S.session.name;
+  const me = shiftNameOf(S.session.uid);
   const board = postsOf('board').sort((a, b) => (b.pinned - a.pinned) || (b.ts - a.ts)).slice(0, 3);
   const prog = postsOf('progress').sort((a, b) => b.ts - a.ts).slice(0, 3);
 
@@ -595,7 +600,7 @@ function vHome() {
 }
 
 function namesHtml(names) {
-  const me = S.session.name;
+  const me = shiftNameOf(S.session.uid);
   return names.length
     ? `<div class="slots">${names.map((n) => `<span class="slot ${n === me ? 'me' : ''}">${esc(dnMember(n))}</span>`).join('')}</div>`
     : '<span class="small muted">なし</span>';
@@ -674,7 +679,7 @@ function todoHtml(item) {
 function vShift() {
   const c = S.content;
   const day = c.shift.days[S.ui.shiftDay] || c.shift.days[0];
-  const me = c.members.indexOf(S.session.name);
+  const me = c.members.indexOf(shiftNameOf(S.session.uid));
   const cols = c.members.map((n, i) => ({ n, i })).filter(({ i }) => !S.ui.onlyMine || i === me);
   const cur = shiftNow();
   return `
@@ -868,7 +873,7 @@ function vAdmin() {
   const users = Object.entries(S.dir)
     .map(([id, name]) => ({ id, name, role: entryByUid(S.keys, id)?.[1].role }))
     .filter((u) => u.role)
-    .sort((x, y) => order(x.name) - order(y.name));
+    .sort((x, y) => order(shiftNameOf(x.id)) - order(shiftNameOf(y.id)));
   const roleSel = (k, cur) => `<select data-k="${k}" style="width:auto"><option value="member" ${cur !== 'admin' ? 'selected' : ''}>部員</option><option value="admin" ${cur === 'admin' ? 'selected' : ''}>管理者</option></select>`;
   return `
   <h2>管理</h2>
@@ -877,9 +882,14 @@ function vAdmin() {
     ${users.map((u) => `
       <div class="todo">
         <div class="row"><span class="grow"><b>${esc(dn(u.id))}</b> <span class="small muted">${esc(u.name)}</span>${adminMark(u.role)}</span>
+          <button class="link" data-act="toggle" data-id="rn-${u.id}">名前変更</button>
           <button class="link" data-act="toggle" data-id="pw-${u.id}">パスワード変更</button>
           ${u.id !== S.session.uid ? `<button class="link danger" data-act="delUser" data-id="${u.id}">削除</button>` : ''}
         </div>
+        ${S.ui.open.has('rn-' + u.id) ? `
+        <form class="compose" data-form="renameUser" data-id="${u.id}">
+          <div class="row"><input class="grow" type="text" data-k="rn-${u.id}" value="${esc(u.name)}" maxlength="20" required><button class="btn small" type="submit">変更</button></div>
+        </form>` : ''}
         ${S.ui.open.has('pw-' + u.id) ? `
         <form class="compose" data-form="userPw" data-id="${u.id}">
           <input type="password" data-k="upw-${u.id}" placeholder="新しいパスワード" autocomplete="new-password" minlength="4" required>
@@ -1067,6 +1077,27 @@ document.addEventListener('submit', async (ev) => {
       if (await mutate((st) => st.todos.push({ id: 't' + randomId(8), date, text, uid: S.session.uid }), 'add todo')) {
         clear(`todo-${date}`); render();
       }
+    } else if (kind === 'renameUser') {
+      // only the roster changes; passwords and sessions are untouched, so nobody is logged out
+      const uid = form.dataset.id;
+      const name = normName(val(`rn-${uid}`));
+      if (!name || name === S.dir[uid]) return;
+      if (Object.entries(S.dir).some(([u, n]) => n === name && u !== uid)) return toast('登録済みの名前です');
+      const orig = shiftNameOf(uid);
+      btn.textContent = '変更中…';
+      if (!S.data.aliases[uid] && S.content.members.includes(orig)) {
+        if (!(await mutate((st) => { st.aliases[uid] ||= orig; }, 'keep shift link'))) return;
+      }
+      await writeKeys(async (keys) => {
+        const dir = keys.dir ? await unseal(S.K, keys.dir) : {};
+        if (!dir[uid]) throw new Error('この部員は削除されています');
+        dir[uid] = name;
+        keys.dir = await seal(S.K, dir);
+      }, 'rename user');
+      S.ui.open.delete(`rn-${uid}`);
+      clear(`rn-${uid}`);
+      toast('変更しました');
+      render();
     } else if (kind === 'userPw') {
       const uid = form.dataset.id;
       const pw = val(`upw-${uid}`);
