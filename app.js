@@ -1,6 +1,7 @@
 import {
-  importDataKey, seal, unseal, randomId, b64, unb64, utf8, fromUtf8, normName, makeUserEntry, openUserEntry,
-} from './crypto.js?v=6';
+  importDataKey, seal, unseal, sealBytes, unsealBytes, randomId, b64, unb64, utf8, fromUtf8, normName,
+  makeUserEntry, openUserEntry, resealUserEntry, newDmKeyPair, dmKey,
+} from './crypto.js?v=7';
 
 const REPO = 'umi-card/seiken-members';
 const BRANCH = 'main';
@@ -16,14 +17,19 @@ const CATS = ['連絡', 'お知らせ', '質問', 'その他'];
 const CAT_CLASS = { 連絡: '', お知らせ: '', 質問: 'q', その他: 'o' };
 const TABS = [
   ['home', 'ホーム'], ['todo', '準備ToDo'], ['shift', 'シフト'], ['plan', '企画書'],
-  ['board', '掲示板'], ['progress', '進捗'],
+  ['board', '掲示板'], ['progress', '進捗'], ['dm', 'DM'],
 ];
+const REACTIONS = ['👍', '❤️', '😂', '😮', '🙏'];
 
 const S = {
   session: null, K: null, token: null, keys: null, dir: {},
   content: null, data: null, sha: null,
-  ui: { open: new Set(), shiftDay: 0, onlyMine: false },
+  ui: { open: new Set(), shiftDay: 0, onlyMine: false, files: {} },
   busy: false,
+  dmKeys: {}, // peer key cache (promises)
+  dmPlain: {}, // decrypted DMs by id; null = could not decrypt
+  imgUrls: {}, // photo id -> promise of blob URL
+  imgReady: {}, // photo id -> blob URL
 };
 
 const $app = document.getElementById('app');
@@ -86,6 +92,22 @@ async function writeFile(path, text, sha, message) {
   return (await r.json()).content.sha;
 }
 
+// Photos are encrypted binaries under data/img/. Pages serves them once deployed; until then read via the API.
+async function writeBinary(path, bytes, message) {
+  if (LOCAL) { localStorage.setItem('local:' + path, b64(bytes)); return; }
+  if (!S.token) throw new Error('保存できません（GitHubキー未設定）');
+  const r = await ghApi(`contents/${path}`, { method: 'PUT', body: JSON.stringify({ message, content: b64(bytes), branch: BRANCH }) });
+  if (!r.ok) throw new Error(`写真の保存に失敗しました（GitHub ${r.status}）`);
+}
+
+async function readBinary(path) {
+  if (LOCAL) { const v = localStorage.getItem('local:' + path); if (v) return unb64(v); }
+  let r = await fetch(path);
+  if (!r.ok && S.token && !LOCAL) r = await ghApi(`contents/${path}?ref=${BRANCH}`, { headers: { Accept: 'application/vnd.github.raw' } });
+  if (!r.ok) throw new Error(`${path}: ${r.status}`);
+  return r.arrayBuffer();
+}
+
 async function fetchKeys() {
   const { text } = await readFile(KEYS_PATH);
   return JSON.parse(text);
@@ -94,13 +116,20 @@ async function fetchKeys() {
 async function loadState() {
   const { text, sha } = await readFile(STATE_PATH);
   const state = await unseal(S.K, JSON.parse(text));
-  state.posts ||= []; state.todo ||= {}; state.todos ||= [];
+  state.posts ||= []; state.todo ||= {}; state.todos ||= []; state.dms ||= []; state.pub ||= {}; state.names ||= {};
   return { state, sha };
 }
 
-// Read-modify-write with retry, so simultaneous posts don't overwrite each other
-async function mutate(fn, message) {
-  if (S.busy) return false;
+// Read-modify-write with retry, so simultaneous posts don't overwrite each other.
+// Calls are queued so a second save waits for the first instead of being dropped.
+let saveQueue = Promise.resolve();
+function mutate(fn, message) {
+  const run = saveQueue.then(() => mutateNow(fn, message));
+  saveQueue = run.catch(() => {});
+  return run;
+}
+
+async function mutateNow(fn, message) {
   S.busy = true;
   try {
     for (let i = 0; i < 5; i++) {
@@ -110,6 +139,7 @@ async function mutate(fn, message) {
         S.sha = await writeFile(STATE_PATH, JSON.stringify(await seal(S.K, state)), sha, message);
         S.data = state;
         render();
+        prepDms().then(render);
         return true;
       } catch (e) {
         if (!e.conflict) throw e;
@@ -155,9 +185,11 @@ async function openSession(sess) {
   S.content = await unseal(S.K, await r.json());
   const { state, sha } = await loadState();
   S.data = state; S.sha = sha;
+  await prepDms();
+  setupDm();
 }
 
-const sessionValid = (keys, sess) => !!sess?.id && keys.users?.[sess.id]?.kid === sess.kid;
+const sessionValid = (keys, sess) => !!sess?.ek && keys.users?.[sess.id]?.kid === sess.kid;
 const entryByUid = (keys, uid) => Object.entries(keys.users).find(([, e]) => e.uid === uid);
 
 async function boot() {
@@ -169,6 +201,7 @@ async function boot() {
     $app.innerHTML = '<p class="boot">読み込みに失敗しました</p>';
     return;
   }
+  if (saved && !saved.ek) { clearSession(); return renderLogin(); } // session from before DMs existed
   if (sessionValid(S.keys, saved)) {
     try {
       // the role may have been changed by the admin since the last visit
@@ -198,6 +231,8 @@ async function refresh(quiet = true) {
     const { state, sha } = await loadState();
     const changed = JSON.stringify(state) !== JSON.stringify(S.data);
     S.data = state; S.sha = sha;
+    await prepDms();
+    setupDm();
     if (changed || !quiet) render();
     if (!quiet) toast('更新しました');
   } catch {
@@ -226,7 +261,7 @@ function renderLogin(err = '') {
       S.keys = await fetchKeys();
       const u = await openUserEntry(pw, S.keys);
       if (!u) throw new Error('パスワードが違います');
-      await openSession({ id: u.id, uid: u.entry.uid, name: u.name, role: u.entry.role, k: u.k, kid: u.entry.kid });
+      await openSession({ id: u.id, uid: u.entry.uid, name: u.name, role: u.entry.role, k: u.k, kid: u.entry.kid, ek: u.ek, priv: u.priv });
       saveSession();
       if (!location.hash) location.hash = '#home';
       render();
@@ -235,6 +270,115 @@ function renderLogin(err = '') {
       btn.disabled = false; btn.textContent = 'ログイン';
     }
   });
+}
+
+/* ---------- DM keys ---------- */
+const pubOf = (j) => ({ kty: j.kty, crv: j.crv, x: j.x, y: j.y });
+
+// Make sure I have a DM key pair (kept inside my encrypted user entry) and that my public key is published
+let dmSetupRunning = false;
+async function setupDm() {
+  if (dmSetupRunning || !S.session || (!S.token && !LOCAL)) return;
+  const uid = S.session.uid;
+  if (S.session.priv && S.data.pub[uid]?.x === S.session.priv.x) return;
+  dmSetupRunning = true;
+  try {
+    if (!S.session.priv) {
+      const { priv } = await newDmKeyPair();
+      await writeKeys(async (keys) => {
+        const e = keys.users[S.session.id];
+        if (!e) throw new Error('session gone');
+        keys.users[S.session.id] = await resealUserEntry(S.session.ek, e, { k: S.session.k, name: S.session.name, priv });
+      }, 'dm key');
+      S.session.priv = priv;
+      saveSession();
+    }
+    const pub = pubOf(S.session.priv);
+    if (await mutate((st) => { st.pub[uid] = pub; }, 'dm public key')) render();
+  } catch {
+    // try again on the next refresh
+  } finally {
+    dmSetupRunning = false;
+  }
+}
+
+function peerKey(peer) {
+  const pub = S.data.pub[peer];
+  if (!pub || !S.session.priv) return null;
+  const tag = `${peer}:${pub.x}:${S.session.priv.x}`;
+  return (S.dmKeys[tag] ||= dmKey(S.session.priv, pub));
+}
+
+async function prepDms() {
+  const me = S.session?.uid;
+  if (!me || !S.session.priv) return;
+  for (const m of S.data.dms) {
+    if ((m.from !== me && m.to !== me) || m.id in S.dmPlain) continue;
+    const key = peerKey(m.from === me ? m.to : m.from);
+    if (!key) continue;
+    try { S.dmPlain[m.id] = await unseal(await key, m); } catch { S.dmPlain[m.id] = null; }
+  }
+}
+
+/* ---------- photos ---------- */
+async function shrink(file) {
+  const url = URL.createObjectURL(file);
+  try {
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const scale = Math.min(1, 1600 / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.naturalWidth * scale);
+    c.height = Math.round(img.naturalHeight * scale);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.82));
+    return new Uint8Array(await blob.arrayBuffer());
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function uploadPhotos(fkey, encKey) {
+  const files = S.ui.files[fkey] || [];
+  const ids = [];
+  if (files.length) toast('写真を送信中…');
+  for (const f of files) {
+    const id = randomId(12);
+    await writeBinary(`data/img/${id}.bin`, await sealBytes(encKey, await shrink(f)), 'photo');
+    ids.push(id);
+  }
+  return ids;
+}
+
+function photoPicker(fkey) {
+  const n = (S.ui.files[fkey] || []).length;
+  return `<label class="btn small ghost">写真<input type="file" accept="image/*" multiple data-photo="${fkey}" hidden></label>
+    ${n ? `<span class="small">${n}枚</span><button type="button" class="link" data-act="clearPhotos" data-id="${fkey}">取消</button>` : ''}
+    <span class="grow"></span>`;
+}
+
+function imgsHtml(ids, peer = '') {
+  if (!ids?.length) return '';
+  return `<div class="imgs">${ids.map((id) => `<img data-img="${id}" data-peer="${peer}" alt="" ${S.imgReady[id] ? `src="${S.imgReady[id]}"` : ''}>`).join('')}</div>`;
+}
+
+async function hydrateImages() {
+  for (const el of document.querySelectorAll('img[data-img]:not([src])')) {
+    const { img: id, peer } = el.dataset;
+    try {
+      S.imgUrls[id] ||= (async () => {
+        const key = peer ? await peerKey(peer) : S.K;
+        if (!key) throw new Error('no key');
+        const bytes = await unsealBytes(key, await readBinary(`data/img/${id}.bin`));
+        return (S.imgReady[id] = URL.createObjectURL(new Blob([bytes], { type: 'image/jpeg' })));
+      })();
+      el.src = await S.imgUrls[id];
+    } catch {
+      delete S.imgUrls[id];
+      el.classList.add('broken');
+    }
+  }
 }
 
 /* ---------- display name ---------- */
@@ -335,15 +479,15 @@ const tm = (t) => t.replace('~', '〜');
 
 /* ---------- render ---------- */
 function route() {
-  const view = location.hash.slice(1) || 'home';
+  const [view, arg] = (location.hash.slice(1) || 'home').split('/');
   const ok = TABS.some(([k]) => k === view) || (view === 'admin' && isAdmin());
-  return { view: ok ? view : 'home' };
+  return { view: ok ? view : 'home', arg };
 }
 
 function render() {
   if (!S.session) return renderLogin();
   if (!S.data.names?.[S.session.uid] && !S.ui.namePrompted) return renderDisplayName(true);
-  const { view } = route();
+  const { view, arg } = route();
 
   // keep half-typed text and focus across re-renders
   const kept = {};
@@ -352,7 +496,8 @@ function render() {
 
   document.title = S.content.title;
   const tabs = [...TABS, ...(isAdmin() ? [['admin', '管理']] : [])];
-  const body = { home: vHome, todo: vTodo, shift: vShift, plan: vPlan, board: vBoard, progress: vProgress, admin: vAdmin }[view]();
+  const body = { home: vHome, todo: vTodo, shift: vShift, plan: vPlan, board: vBoard, progress: vProgress, dm: vDm, admin: vAdmin }[view](arg);
+  const unread = unreadTotal();
   $app.innerHTML = `
   <header class="top">
     <div class="bar">
@@ -361,12 +506,13 @@ function render() {
       <span class="who"><button class="link" data-act="rename"><b>${esc(dn(S.session.uid))}</b></button>${adminMark(S.session.role)}</span>
       <button class="link" data-act="logout">ログアウト</button>
     </div>
-    <nav class="tabs">${tabs.map(([k, l]) => `<a href="#${k}" class="${k === view ? 'on' : ''}">${l}</a>`).join('')}</nav>
+    <nav class="tabs">${tabs.map(([k, l]) => `<a href="#${k}" class="${k === view ? 'on' : ''}">${l}${k === 'dm' && unread ? ` <span class="count">${unread}</span>` : ''}</a>`).join('')}</nav>
   </header>
   <main>${!S.token && !LOCAL && isAdmin() ? '<div class="banner">GitHubキー未設定</div>' : ''}${body}</main>`;
 
   document.querySelectorAll('[data-k]').forEach((el) => { if (kept[el.dataset.k] != null) el.value = kept[el.dataset.k]; });
   if (focusK) document.querySelector(`[data-k="${focusK}"]`)?.focus();
+  hydrateImages();
 }
 
 /* home */
@@ -491,7 +637,7 @@ function todoHtml(item) {
           ${reports.map((p) => postHtml(p, { comments: false, compact: true })).join('')}
           <form class="compose" data-form="progress" data-ref="${item.id}">
             <textarea data-k="prog-${item.id}" maxlength="2000" rows="2"></textarea>
-            <div class="row"><button class="btn small" type="submit">報告</button></div>
+            <div class="row">${photoPicker(`prog-${item.id}`)}<button class="btn small" type="submit">報告</button></div>
           </form></div>` : ''}
       </div>
     </div>
@@ -544,6 +690,13 @@ function vPlan() {
 }
 
 /* posts */
+function reactHtml(p) {
+  const re = p.re || {};
+  const open = S.ui.open.has('rx-' + p.id);
+  const btn = (e) => `<button class="rx ${re[e]?.includes(S.session.uid) ? 'on' : ''}" data-act="react" data-id="${p.id}" data-e="${e}" title="${esc((re[e] || []).map(dn).join('、'))}">${e}${re[e]?.length ? ` ${re[e].length}` : ''}</button>`;
+  return `${REACTIONS.filter((e) => re[e]?.length || open).map(btn).join('')}<button class="link" data-act="toggle" data-id="rx-${p.id}">${open ? '閉じる' : 'リアクション'}</button>`;
+}
+
 function postHtml(p, { comments = true, compact = false } = {}) {
   const cmts = comments ? postsOf('comment', p.id).sort((a, b) => a.ts - b.ts) : [];
   const open = S.ui.open.has(p.id);
@@ -556,8 +709,10 @@ function postHtml(p, { comments = true, compact = false } = {}) {
       ${ref ? `<span class="badge">${esc(ref.text.length > 24 ? ref.text.slice(0, 24) + '…' : ref.text)}</span>` : ''}
       <span class="a">${esc(whoOf(p))}</span>${adminMark(p.role)}<span class="ts">${fmtTs(p.ts)}</span>
     </div>
-    <div class="post-b">${linkify(p.body)}</div>
+    ${p.body ? `<div class="post-b">${linkify(p.body)}</div>` : ''}
+    ${imgsHtml(p.imgs)}
     <div class="post-f small">
+      ${reactHtml(p)}
       ${comments ? `<button class="link" data-act="toggle" data-id="${p.id}">コメント${cmts.length ? `(${cmts.length})` : ''}</button>` : ''}
       ${isAdmin() && p.kind === 'board' ? `<button class="link" data-act="pin" data-id="${p.id}">${p.pinned ? '固定解除' : '固定'}</button>` : ''}
       ${canDelete(p) ? `<button class="link danger" data-act="del" data-id="${p.id}">削除</button>` : ''}
@@ -566,7 +721,7 @@ function postHtml(p, { comments = true, compact = false } = {}) {
       ${cmts.map((c) => postHtml(c, { comments: false, compact: true })).join('')}
       <form class="compose" data-form="comment" data-ref="${p.id}">
         <textarea data-k="cmt-${p.id}" maxlength="2000" rows="2"></textarea>
-        <div class="row"><button class="btn small" type="submit">送信</button></div>
+        <div class="row">${photoPicker(`cmt-${p.id}`)}<button class="btn small" type="submit">送信</button></div>
       </form></div>` : ''}
   </div>`;
 }
@@ -579,7 +734,7 @@ function vBoard() {
     <form class="compose" data-form="board" style="margin-top:0">
       <select data-k="board-cat" style="width:auto">${CATS.map((c) => `<option>${c}</option>`).join('')}</select>
       <textarea data-k="board-body" maxlength="4000" rows="3"></textarea>
-      <div class="row"><button class="btn" type="submit">投稿</button></div>
+      <div class="row">${photoPicker('board-body')}<button class="btn" type="submit">投稿</button></div>
     </form>
   </div>
   <div class="card">${posts.length ? posts.map((p) => postHtml(p)).join('') : '<p class="empty">投稿なし</p>'}</div>`;
@@ -596,10 +751,73 @@ function vProgress() {
         ${allTodos().map((d) => `<optgroup label="${esc(d.label)}">${d.items.map((i) => `<option value="${i.id}">${esc(i.text)}</option>`).join('')}</optgroup>`).join('')}
       </select>
       <textarea data-k="prog-body" maxlength="4000" rows="3"></textarea>
-      <div class="row"><button class="btn" type="submit">報告</button></div>
+      <div class="row">${photoPicker('prog-body')}<button class="btn" type="submit">報告</button></div>
     </form>
   </div>
   <div class="card">${posts.length ? posts.map((p) => postHtml(p)).join('') : '<p class="empty">報告なし</p>'}</div>`;
+}
+
+/* DM */
+const readMap = () => { try { return JSON.parse(localStorage.getItem('seiken.read.' + S.session.uid)) || {}; } catch { return {}; } };
+function markRead(peer) {
+  const m = readMap();
+  m[peer] = Date.now();
+  try { localStorage.setItem('seiken.read.' + S.session.uid, JSON.stringify(m)); } catch {}
+}
+const unreadFrom = (peer, rm = readMap()) => S.data.dms.filter((m) => m.from === peer && m.to === S.session.uid && m.ts > (rm[peer] || 0)).length;
+function unreadTotal() {
+  const rm = readMap();
+  return Object.keys(S.dir).reduce((n, u) => n + unreadFrom(u, rm), 0);
+}
+const dmText = (m) => { const d = S.dmPlain[m.id]; return d === undefined ? '…' : d === null ? '表示できません' : d; };
+
+function vDm(peer) {
+  if (peer && S.dir[peer] && peer !== S.session.uid) return vDmThread(peer);
+  const me = S.session.uid;
+  const order = (n) => { const i = S.content.members.indexOf(n); return i < 0 ? 99 : i; };
+  const last = (u) => S.data.dms.filter((m) => (m.from === me && m.to === u) || (m.from === u && m.to === me)).sort((a, b) => b.ts - a.ts)[0];
+  const rm = readMap();
+  const peers = Object.keys(S.dir).filter((u) => u !== me && entryByUid(S.keys, u))
+    .map((u) => ({ u, last: last(u) }))
+    .sort((a, b) => (b.last?.ts || 0) - (a.last?.ts || 0) || order(S.dir[a.u]) - order(S.dir[b.u]));
+  return `
+  <h2>DM</h2>
+  <div class="card">
+    ${peers.map(({ u, last: m }) => {
+      const d = m && dmText(m);
+      const preview = !m ? '' : typeof d === 'string' ? d : d.t || (d.imgs?.length ? '写真' : '');
+      const n = unreadFrom(u, rm);
+      return `<a class="dmrow" href="#dm/${u}">
+        <div class="row"><b class="grow">${esc(dn(u))}</b>${n ? `<span class="count">${n}</span>` : ''}${m ? `<span class="small muted">${fmtTs(m.ts)}</span>` : ''}</div>
+        ${preview ? `<div class="small muted dmprev">${m.from === me ? '自分: ' : ''}${esc(preview)}</div>` : ''}
+      </a>`;
+    }).join('')}
+  </div>`;
+}
+
+function vDmThread(peer) {
+  const me = S.session.uid;
+  markRead(peer);
+  const msgs = S.data.dms.filter((m) => (m.from === me && m.to === peer) || (m.from === peer && m.to === me)).sort((a, b) => a.ts - b.ts);
+  const ready = S.session.priv && S.data.pub[peer];
+  return `
+  <div class="row"><a class="small" href="#dm">← DM</a></div>
+  <h2>${esc(dn(peer))}</h2>
+  <div class="card dmthread">
+    ${msgs.map((m) => {
+      const d = dmText(m);
+      return `<div class="bubble ${m.from === me ? 'mine' : ''}">
+        ${typeof d === 'string' ? `<div class="muted">${esc(d)}</div>` : `${d.t ? `<div class="post-b">${linkify(d.t)}</div>` : ''}${imgsHtml(d.imgs, peer)}`}
+        <div class="small muted">${fmtTs(m.ts)}</div>
+      </div>`;
+    }).join('') || '<p class="empty">メッセージなし</p>'}
+  </div>
+  ${ready ? `<div class="card">
+    <form class="compose" data-form="dm" data-peer="${peer}" style="margin-top:0">
+      <textarea data-k="dm-${peer}" maxlength="4000" rows="2"></textarea>
+      <div class="row">${photoPicker(`dm-${peer}`)}<button class="btn" type="submit">送信</button></div>
+    </form>
+  </div>` : `<p class="empty">${S.session.priv ? '相手が未ログインのため送信できません' : '送信できません'}</p>`}`;
 }
 
 /* admin */
@@ -646,8 +864,9 @@ function vAdmin() {
 }
 
 /* ---------- actions ---------- */
-const newPost = (kind, ref, body, cat = '') => ({
-  id: randomId(), kind, ref, cat, body, uid: S.session.uid, role: S.session.role, ts: Date.now(), pinned: false,
+const hasPhotos = (k) => !!S.ui.files[k]?.length;
+const newPost = (kind, ref, body, cat = '', imgs = []) => ({
+  id: randomId(), kind, ref, cat, body, imgs, uid: S.session.uid, role: S.session.role, ts: Date.now(), pinned: false,
 });
 
 document.addEventListener('click', async (ev) => {
@@ -663,6 +882,20 @@ document.addEventListener('click', async (ev) => {
     return;
   }
   if (act === 'rename') renderDisplayName(false);
+  else if (act === 'react') {
+    const e = el.dataset.e;
+    const uid = S.session.uid;
+    S.ui.open.delete('rx-' + id);
+    await mutate((st) => {
+      const p = st.posts.find((x) => x.id === id);
+      if (!p) return;
+      p.re ||= {};
+      const a = (p.re[e] ||= []);
+      const i = a.indexOf(uid);
+      if (i >= 0) a.splice(i, 1); else a.push(uid);
+      if (!a.length) delete p.re[e];
+    }, 'reaction');
+  } else if (act === 'clearPhotos') { delete S.ui.files[id]; render(); }
   else if (act === 'logout') { clearSession(); location.hash = ''; renderLogin(); }
   else if (act === 'refresh') refresh(false);
   else if (act === 'toggle') { S.ui.open.has(id) ? S.ui.open.delete(id) : S.ui.open.add(id); render(); }
@@ -697,7 +930,25 @@ document.addEventListener('click', async (ev) => {
   }
 });
 
+// tap a photo to see it full size
+document.addEventListener('click', (ev) => {
+  const img = ev.target.closest('img[data-img]');
+  const box = document.getElementById('lightbox');
+  if (img?.src) {
+    box.innerHTML = `<img src="${img.src}" alt="">`;
+    box.classList.add('show');
+  } else if (ev.target.closest('#lightbox')) {
+    box.classList.remove('show');
+  }
+});
+
 document.addEventListener('change', (ev) => {
+  const fkey = ev.target.dataset?.photo;
+  if (fkey) {
+    S.ui.files[fkey] = [...(S.ui.files[fkey] || []), ...ev.target.files].slice(0, 4);
+    render();
+    return;
+  }
   if (ev.target.dataset.act === 'onlyMine') { S.ui.onlyMine = ev.target.checked; render(); }
 });
 
@@ -714,23 +965,38 @@ document.addEventListener('submit', async (ev) => {
   try {
     if (kind === 'board') {
       const body = val('board-body');
-      if (!body) return;
-      if (await mutate((st) => st.posts.push(newPost('board', '', body, val('board-cat') || '連絡')), 'board post')) {
-        clear('board-body'); render(); toast('投稿しました');
+      if (!body && !hasPhotos('board-body')) return;
+      const imgs = await uploadPhotos('board-body', S.K);
+      if (await mutate((st) => st.posts.push(newPost('board', '', body, val('board-cat') || '連絡', imgs)), 'board post')) {
+        delete S.ui.files['board-body']; clear('board-body'); render(); toast('投稿しました');
       }
     } else if (kind === 'comment') {
       const ref = form.dataset.ref;
-      const body = val(`cmt-${ref}`);
-      if (!body) return;
-      if (await mutate((st) => st.posts.push(newPost('comment', ref, body)), 'comment')) { clear(`cmt-${ref}`); render(); }
+      const k = `cmt-${ref}`;
+      const body = val(k);
+      if (!body && !hasPhotos(k)) return;
+      const imgs = await uploadPhotos(k, S.K);
+      if (await mutate((st) => st.posts.push(newPost('comment', ref, body, '', imgs)), 'comment')) { delete S.ui.files[k]; clear(k); render(); }
     } else if (kind === 'progress') {
       const ref = form.dataset.ref ?? val('prog-ref');
       const k = form.dataset.ref ? `prog-${ref}` : 'prog-body';
       const body = val(k);
-      if (!body) return;
-      if (await mutate((st) => st.posts.push(newPost('progress', ref, body)), 'progress report')) {
-        clear(k); render(); toast('報告しました');
+      if (!body && !hasPhotos(k)) return;
+      const imgs = await uploadPhotos(k, S.K);
+      if (await mutate((st) => st.posts.push(newPost('progress', ref, body, '', imgs)), 'progress report')) {
+        delete S.ui.files[k]; clear(k); render(); toast('報告しました');
       }
+    } else if (kind === 'dm') {
+      const peer = form.dataset.peer;
+      const k = `dm-${peer}`;
+      const text = val(k);
+      if (!text && !hasPhotos(k)) return;
+      const key = await peerKey(peer);
+      if (!key) return toast('送信できません');
+      const imgs = await uploadPhotos(k, key);
+      const msg = { id: randomId(), from: S.session.uid, to: peer, ts: Date.now(), ...(await seal(key, { t: text, imgs })) };
+      S.dmPlain[msg.id] = { t: text, imgs };
+      if (await mutate((st) => st.dms.push(msg), 'dm')) { delete S.ui.files[k]; clear(k); render(); }
     } else if (kind === 'todoAdd') {
       const date = form.dataset.date;
       const text = val(`todo-${date}`);
@@ -745,17 +1011,20 @@ document.addEventListener('submit', async (ev) => {
       const self = uid === S.session.uid;
       const role = self ? S.session.role : val(`urole-${uid}`) || 'member';
       btn.textContent = '変更中…';
-      let newId;
+      let newId, newEk;
       await writeKeys(async (keys) => {
         const old = entryByUid(keys, uid);
         if (!old) throw new Error('この部員は削除されています');
-        const { id, entry } = await makeUserEntry(pw, S.session.k, { uid, name: S.dir[uid], role }, keys);
+        // keep my own DM key; anyone else gets a new one on their next login
+        const priv = self ? S.session.priv : null;
+        const { id, ek, entry } = await makeUserEntry(pw, S.session.k, { uid, name: S.dir[uid], role, priv }, keys);
+        newEk = ek;
         if (keys.users[id] && keys.users[id].uid !== uid) throw new Error('他の人と同じパスワードは使えません');
         delete keys.users[old[0]];
         keys.users[id] = entry;
         newId = id;
       }, 'change user password');
-      if (self) { S.session.id = newId; S.session.kid = S.keys.users[newId].kid; saveSession(); }
+      if (self) { S.session.id = newId; S.session.ek = newEk; S.session.kid = S.keys.users[newId].kid; saveSession(); }
       S.ui.open.delete(`pw-${uid}`);
       toast('変更しました');
       render();

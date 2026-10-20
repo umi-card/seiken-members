@@ -19,13 +19,6 @@ export function randomId(len = 10) {
   return Array.from(crypto.getRandomValues(new Uint8Array(len)), (x) => a[x % a.length]).join('');
 }
 
-async function pwKey(pw, salt, iter) {
-  const base = await crypto.subtle.importKey('raw', te.encode(pw), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: iter, hash: 'SHA-256' },
-    base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
-}
-
 export const importDataKey = (rawB64) =>
   crypto.subtle.importKey('raw', unb64(rawB64), 'AES-GCM', false, ['encrypt', 'decrypt']);
 
@@ -66,41 +59,45 @@ export async function pwLookup(pw, saltB64, iter) {
   const base = await crypto.subtle.importKey('raw', te.encode(pw), 'PBKDF2', false, ['deriveBits']);
   const bits = new Uint8Array(await crypto.subtle.deriveBits(
     { name: 'PBKDF2', salt: unb64(saltB64), iterations: iter, hash: 'SHA-256' }, base, 512));
-  const key = await crypto.subtle.importKey('raw', bits.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']);
+  const ek = b64(bits.slice(0, 32));
   const id = Array.from(bits.slice(32, 44), (x) => x.toString(16).padStart(2, '0')).join('');
-  return { id, key };
+  return { id, ek, key: await importDataKey(ek) };
 }
 
-// Entry stored at keys.users[id]; the name and data key are inside the ciphertext
-export async function makeUserEntry(pw, rawK, { uid, name, role }, keys) {
-  const { id, key } = await pwLookup(pw, keys.salt, keys.iter);
-  return { id, entry: { ...(await seal(key, { k: rawK, name })), kid: randomId(8), uid, role } };
+// Entry stored at keys.users[id]; the data key, name and DM private key are inside the ciphertext.
+// `ek` (the entry key) is kept in the session so the entry can be re-sealed later without the password.
+export async function makeUserEntry(pw, rawK, { uid, name, role, priv = null }, keys) {
+  const { id, ek, key } = await pwLookup(pw, keys.salt, keys.iter);
+  return { id, ek, entry: { ...(await seal(key, { k: rawK, name, priv })), kid: randomId(8), uid, role } };
+}
+
+export async function resealUserEntry(ek, entry, payload) {
+  return { ...entry, ...(await seal(await importDataKey(ek), payload)) };
 }
 
 export async function openUserEntry(pw, keys) {
-  const { id, key } = await pwLookup(pw, keys.salt, keys.iter);
+  const { id, ek, key } = await pwLookup(pw, keys.salt, keys.iter);
   const entry = keys.users?.[id];
   if (!entry) return null;
   try {
-    const { k, name } = await unseal(key, entry);
-    return { id, entry, k, name };
+    const { k, name, priv = null } = await unseal(key, entry);
+    return { id, ek, entry, k, name, priv };
   } catch {
     return null;
   }
 }
 
-// Wrap the data key with a password. A new kid means "sessions made with the old password are void".
-export async function wrapDataKey(pw, rawB64, iter = ITER) {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const box = await seal(await pwKey(pw, salt, iter), { k: rawB64 });
-  return { salt: b64(salt), ...box, kid: randomId(8) };
+// DMs: each user has an ECDH key pair; two users derive the same AES key from it
+export async function newDmKeyPair() {
+  const kp = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveKey']);
+  return {
+    priv: await crypto.subtle.exportKey('jwk', kp.privateKey),
+    pub: await crypto.subtle.exportKey('jwk', kp.publicKey),
+  };
 }
 
-export async function unwrapDataKey(pw, entry, iter = ITER) {
-  try {
-    const { k } = await unseal(await pwKey(pw, unb64(entry.salt), iter), entry);
-    return k;
-  } catch {
-    return null;
-  }
+export async function dmKey(privJwk, pubJwk) {
+  const priv = await crypto.subtle.importKey('jwk', privJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, ['deriveKey']);
+  const pub = await crypto.subtle.importKey('jwk', pubJwk, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  return crypto.subtle.deriveKey({ name: 'ECDH', public: pub }, priv, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
 }
