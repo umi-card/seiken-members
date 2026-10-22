@@ -1,7 +1,7 @@
 import {
   importDataKey, seal, unseal, sealBytes, unsealBytes, randomId, b64, unb64, utf8, fromUtf8, normName,
   makeUserEntry, openUserEntry, resealUserEntry, newDmKeyPair, dmKey,
-} from './crypto.js?v=9';
+} from './crypto.js?v=10';
 
 const REPO = 'umi-card/seiken-members';
 const BRANCH = 'main';
@@ -462,7 +462,7 @@ function rowNames(row) {
   const m = S.content.members;
   return {
     on: m.filter((_, i) => row.c[i] === '○'),
-    sym: m.map((n, i) => (row.c[i] === '※' || row.c[i] === 'ー' ? `${dnMember(n)}（${row.c[i]}）` : null)).filter(Boolean),
+    sym: m.map((n, i) => (['※', 'ー', '△'].includes(row.c[i]) ? `${dnMember(n)}（${row.c[i]}）` : null)).filter(Boolean),
   };
 }
 
@@ -494,10 +494,12 @@ function myRanges(day, name) {
   if (idx < 0) return [];
   const out = [];
   for (const r of day.rows) {
-    if (r.closed || r.c[idx] !== '○') continue;
+    const v = r.c?.[idx];
+    if (r.closed || (v !== '○' && v !== '△')) continue;
     const [s, e] = r.t.split('~');
     const last = out[out.length - 1];
-    if (last && last.e === s) last.e = e; else out.push({ s, e });
+    if (v === '○' && last && !last.mark && last.e === s) last.e = e;
+    else out.push({ s, e, mark: v === '△' ? '△' : '' });
   }
   return out;
 }
@@ -589,7 +591,7 @@ function vHome() {
       ${c.shift.days.map((day) => {
         const r = myRanges(day, me);
         return `<div class="small muted" style="margin:4px 0 2px">${esc(day.label)}</div>
-          <div class="slots">${r.length ? r.map((x) => `<span class="slot">${x.s}〜${x.e}</span>`).join('') : '<span class="small muted">なし</span>'}</div>`;
+          <div class="slots">${r.length ? r.map((x) => `<span class="slot">${x.s}〜${x.e}${x.mark}</span>`).join('') : '<span class="small muted">なし</span>'}</div>`;
       }).join('')}
     </div>` : ''}
   </div>
